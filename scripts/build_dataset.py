@@ -54,10 +54,12 @@ def collect_pairs(obj: Any, value_min: float, value_max: float) -> List[Tuple[in
 
     def rec(o: Any):
         if isinstance(o, list):
-            # caso: lista grande de pares
-            if len(o) >= 10 and all(isinstance(e, (list, tuple)) and len(e) >= 2 for e in o[:10]):
-                score = sum(1 for e in o[:10] if is_epoch(e[0]))
-                if score >= 8:
+            # Acepta listas cortas: BB y algunas series pueden tener pocos puntos
+            n = min(10, len(o))
+            if len(o) >= 2 and all(isinstance(e, (list, tuple)) and len(e) >= 2 for e in o[:n]):
+                score = sum(1 for e in o[:n] if is_epoch(e[0]))
+                # requiere "epoch" en la mayoría de los primeros elementos
+                if score >= max(2, int(0.7 * n)):
                     for e in o:
                         ts, val = e[0], e[1]
                         if val is None:

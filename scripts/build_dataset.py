@@ -80,7 +80,7 @@ def collect_pairs(obj: Any, value_min: float, value_max: float) -> List[Tuple[in
 
 def pairs_to_series(pairs: List[Tuple[int, float]], tz: str) -> pd.Series:
     if not pairs:
-        return pd.Series(dtype="float64")
+        return pd.Series(dtype="float64", index=pd.DatetimeIndex([], tz=tz, name="timestamp"))
     df = pd.DataFrame(pairs, columns=["ts", "value"]).dropna()
     ts = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True).dt.tz_convert(tz)
     s = pd.Series(df["value"].astype("float64").to_numpy(), index=ts).sort_index()

@@ -1,179 +1,327 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Construye datasets limpios desde data/raw.
+
+Outputs:
+- data/processed/minute.parquet : 1 fila = 1 minuto (timestamp) con columnas:
+  hr, stress, resp, bb, steps, kcal, sleep_flag
+- data/processed/daily.parquet  : 1 fila = 1 día (date) con columnas resumen + coberturas.
+
+Soporta:
+- múltiples body_battery_*.json (los concatena)
+- días vacíos (los descarta)
+- relleno de BB dentro del día (ffill/bfill o interpolación)
+"""
+
 import argparse
 import json
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 
-TZ = "Europe/Madrid"
 
-def load_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+def load_json(p: Path) -> Any:
+    return json.loads(p.read_text(encoding="utf-8"))
 
-def ts_df_from_pairs(pairs, col):
+
+def discover_days(raw_dir: Path) -> List[str]:
+    days = set()
+    for p in raw_dir.glob("????-??-??_*.json"):
+        # evita *_error.json si quieres, pero no molesta
+        day = p.name.split("_")[0]
+        if day.count("-") == 2:
+            days.add(day)
+    return sorted(days)
+
+
+def to_epoch_ms(x: float) -> int:
+    v = int(x)
+    return v * 1000 if v < 10_000_000_000 else v
+
+
+def collect_pairs(obj: Any, value_min: float, value_max: float) -> List[Tuple[int, float]]:
+    """
+    Busca recursivamente listas de pares [timestamp,value].
+    Filtra por rango de valores para evitar basura.
+    """
+    out: List[Tuple[int, float]] = []
+
+    def is_epoch(v) -> bool:
+        return isinstance(v, (int, float)) and v > 1e9
+
+    def rec(o: Any):
+        if isinstance(o, list):
+            # caso: lista grande de pares
+            if len(o) >= 10 and all(isinstance(e, (list, tuple)) and len(e) >= 2 for e in o[:10]):
+                score = sum(1 for e in o[:10] if is_epoch(e[0]))
+                if score >= 8:
+                    for e in o:
+                        ts, val = e[0], e[1]
+                        if val is None:
+                            continue
+                        if not isinstance(val, (int, float)):
+                            continue
+                        v = float(val)
+                        if value_min <= v <= value_max:
+                            out.append((to_epoch_ms(ts), v))
+                    return
+            for e in o:
+                rec(e)
+        elif isinstance(o, dict):
+            for v in o.values():
+                rec(v)
+
+    rec(obj)
+    return out
+
+
+def pairs_to_series(pairs: List[Tuple[int, float]], tz: str) -> pd.Series:
     if not pairs:
-        return pd.DataFrame(columns=[col], index=pd.DatetimeIndex([], name="timestamp"))
-    df = pd.DataFrame(pairs, columns=["ts_ms", col])
-    df = df.dropna(subset=["ts_ms"])
-    df["timestamp"] = pd.to_datetime(df["ts_ms"].astype("int64"), unit="ms", utc=True).dt.tz_convert(TZ)
-    df = df.drop(columns=["ts_ms"]).set_index("timestamp").sort_index()
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df[~df.index.duplicated(keep="last")]
-    return df[[col]]
+        return pd.Series(dtype="float64")
+    df = pd.DataFrame(pairs, columns=["ts", "value"]).dropna()
+    ts = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True).dt.tz_convert(tz)
+    s = pd.Series(df["value"].astype("float64").to_numpy(), index=ts).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    return s
 
-def extract_pairs_generic(obj):
-    if isinstance(obj, dict):
-        for k in [
-            "heartRateValues", "heartRateValuesArray",
-            "stressValuesArray", "stressValues",
-            "respirationValuesArray", "respirationValues",
-            "values",
-        ]:
-            v = obj.get(k)
-            if isinstance(v, list) and v and isinstance(v[0], (list, tuple)) and len(v[0]) >= 2:
-                return v
-    return []
 
-def extract_bb_from_bodybattery_json(bb_obj):
-    pairs=[]
-    if isinstance(bb_obj, list):
-        for day in bb_obj:
-            if isinstance(day, dict):
-                arr = day.get("bodyBatteryValuesArray")
-                if isinstance(arr, list):
-                    for e in arr:
-                        if isinstance(e,(list,tuple)) and len(e)>=2 and e[1] is not None:
-                            pairs.append([e[0], e[1]])
-    elif isinstance(bb_obj, dict):
-        arr = bb_obj.get("bodyBatteryValuesArray")
-        if isinstance(arr, list):
-            for e in arr:
-                if isinstance(e,(list,tuple)) and len(e)>=2 and e[1] is not None:
-                    pairs.append([e[0], e[1]])
-    return pairs
+def load_body_battery_series(raw_dir: Path, tz: str) -> pd.Series:
+    pairs_all: List[Tuple[int, float]] = []
+    for p in sorted(raw_dir.glob("body_battery_*.json")):
+        if "error" in p.name.lower():
+            continue
+        try:
+            obj = load_json(p)
+            pairs_all.extend(collect_pairs(obj, 0, 100))
+        except Exception:
+            continue
+    return pairs_to_series(pairs_all, tz)
+
+
+def find_first_number(obj: Any, keys: List[str]) -> Optional[float]:
+    found: List[float] = []
+
+    def rec(o: Any):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in keys and isinstance(v, (int, float)):
+                    found.append(float(v))
+                rec(v)
+        elif isinstance(o, list):
+            for e in o:
+                rec(e)
+
+    rec(obj)
+    return found[0] if found else None
+
+
+def parse_sleep_window(obj: Any, tz: str) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Intenta encontrar sleepStartTimestamp* y sleepEndTimestamp* (ms o ISO) dentro del JSON.
+    """
+    start_keys = ["sleepStartTimestampGMT", "sleepStartTimestampLocal"]
+    end_keys = ["sleepEndTimestampGMT", "sleepEndTimestampLocal"]
+
+    def parse_ts(v) -> Optional[pd.Timestamp]:
+        if isinstance(v, (int, float)):
+            return pd.to_datetime(int(v), unit="ms", utc=True).tz_convert(tz)
+        if isinstance(v, str) and v.strip():
+            t = pd.to_datetime(v, errors="coerce")
+            if pd.isna(t):
+                return None
+            if t.tzinfo is None:
+                return t.tz_localize(tz)
+            return t.tz_convert(tz)
+        return None
+
+    def rec(o: Any) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+        if isinstance(o, dict):
+            for sk in start_keys:
+                if sk in o:
+                    for ek in end_keys:
+                        if ek in o:
+                            s = parse_ts(o[sk])
+                            e = parse_ts(o[ek])
+                            if s is not None and e is not None:
+                                return (s, e)
+            for v in o.values():
+                r = rec(v)
+                if r is not None:
+                    return r
+        elif isinstance(o, list):
+            for e in o:
+                r = rec(e)
+                if r is not None:
+                    return r
+        return None
+
+    return rec(obj)
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw", default="data/raw", help="Carpeta RAW")
-    ap.add_argument("--out", default="data/processed", help="Carpeta processed")
-    ap.add_argument("--freq", default="1min", help="Frecuencia destino (1min, 5min, 15min...)")
+    ap.add_argument("--raw", type=str, default="data/raw")
+    ap.add_argument("--out", type=str, default="data/processed")
+    ap.add_argument("--tz", type=str, default="Europe/Madrid")
+    ap.add_argument("--freq", type=str, default="1min")
+    ap.add_argument("--bb-fill", type=str, default="ffill_bfill", choices=["none", "ffill", "ffill_bfill", "interpolate"])
+    ap.add_argument("--drop-empty-days", action="store_true", help="Descarta días sin datos útiles (recomendado)")
+    ap.add_argument("--write-csv", action="store_true", help="Además de parquet, escribe CSV")
     args = ap.parse_args()
 
-    raw = Path(args.raw)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    raw_dir = Path(args.raw).expanduser()
+    out_dir = Path(args.out).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    days = sorted({p.name.split("_")[0] for p in raw.glob("????-??-??_heart_rates.json")})
+    days = discover_days(raw_dir)
     if not days:
-        raise SystemExit("No encuentro RAW tipo YYYY-MM-DD_heart_rates.json en data/raw")
+        raise SystemExit(f"No encuentro días en {raw_dir} (esperaba ficheros YYYY-MM-DD_*.json)")
 
-    hr_frames=[]
-    st_frames=[]
-    rp_frames=[]
-    sleep_intervals=[]
-    daily_rows=[]
+    bb_global = load_body_battery_series(raw_dir, args.tz)
 
-    bb_series = pd.DataFrame(columns=["bb"], index=pd.DatetimeIndex([], name="timestamp"))
-    bb_files = sorted(raw.glob("body_battery_*.json"))
-    if bb_files:
-        bb_obj = load_json(bb_files[0])
-        bb_pairs = extract_bb_from_bodybattery_json(bb_obj)
-        bb_series = ts_df_from_pairs(bb_pairs, "bb")
+    minute_frames: List[pd.DataFrame] = []
+    daily_rows: List[Dict[str, Any]] = []
 
     for ds in days:
-        hr_day = ts_df_from_pairs(extract_pairs_generic(load_json(raw / f"{ds}_heart_rates.json")), "hr")
-        st_day = ts_df_from_pairs(extract_pairs_generic(load_json(raw / f"{ds}_stress.json")), "stress")
-        rp_day = ts_df_from_pairs(extract_pairs_generic(load_json(raw / f"{ds}_respiration.json")), "resp")
-        if not hr_day.empty: hr_frames.append(hr_day)
-        if not st_day.empty: st_frames.append(st_day)
-        if not rp_day.empty: rp_frames.append(rp_day)
+        day_start = pd.Timestamp(ds).tz_localize(args.tz)
+        day_end = day_start + pd.Timedelta(days=1)
+        # índice del día a freq
+        day_idx = pd.date_range(
+            start=day_start,
+            end=day_end - pd.Timedelta(args.freq),
+            freq=args.freq,
+        )
+        day_df = pd.DataFrame(index=day_idx)
 
-        us = load_json(raw / f"{ds}_user_summary.json")
-        steps = us.get("totalSteps") if isinstance(us, dict) else None
-        kcal = us.get("totalKilocalories") if isinstance(us, dict) else None
+        # Carga por día (si existe)
+        p_hr = raw_dir / f"{ds}_heart_rates.json"
+        p_st = raw_dir / f"{ds}_stress.json"
+        p_re = raw_dir / f"{ds}_respiration.json"
+        p_sl = raw_dir / f"{ds}_sleep.json"
+        p_us = raw_dir / f"{ds}_user_summary.json"
 
-        sl = load_json(raw / f"{ds}_sleep.json")
-        sleep_flag = 1 if sl else 0
+        # Series temporales
+        if p_hr.exists():
+            s = pairs_to_series(collect_pairs(load_json(p_hr), 20, 250), args.tz)
+            s = s[(s.index >= day_start) & (s.index < day_end)].resample(args.freq).mean()
+            day_df["hr"] = s.reindex(day_idx)
+        else:
+            day_df["hr"] = pd.NA
 
-        def find_key(obj, key):
-            if isinstance(obj, dict):
-                if key in obj: return obj[key]
-                for v in obj.values():
-                    r = find_key(v, key)
-                    if r is not None: return r
-            elif isinstance(obj, list):
-                for v in obj:
-                    r = find_key(v, key)
-                    if r is not None: return r
-            return None
+        if p_st.exists():
+            s = pairs_to_series(collect_pairs(load_json(p_st), 0, 100), args.tz)
+            s = s[(s.index >= day_start) & (s.index < day_end)].resample(args.freq).mean()
+            day_df["stress"] = s.reindex(day_idx)
+        else:
+            day_df["stress"] = pd.NA
 
-        s = find_key(sl, "sleepStartTimestampGMT")
-        e = find_key(sl, "sleepEndTimestampGMT")
-        if isinstance(s,(int,float)) and isinstance(e,(int,float)):
-            sleep_intervals.append((int(s), int(e)))
+        if p_re.exists():
+            s = pairs_to_series(collect_pairs(load_json(p_re), 2, 60), args.tz)
+            s = s[(s.index >= day_start) & (s.index < day_end)].resample(args.freq).mean()
+            day_df["resp"] = s.reindex(day_idx)
+        else:
+            day_df["resp"] = pd.NA
 
-        bb_val=None
-        if not bb_series.empty:
-            day_start = pd.Timestamp(ds).tz_localize(TZ)
-            day_end = day_start + pd.Timedelta(days=1)
-            slc = bb_series.loc[(bb_series.index >= day_start) & (bb_series.index < day_end)]
-            if not slc.empty and not slc["bb"].dropna().empty:
-                bb_val=float(slc["bb"].dropna().iloc[-1])
+        # Body Battery desde global
+        if not bb_global.empty:
+            s = bb_global[(bb_global.index >= day_start) & (bb_global.index < day_end)].resample(args.freq).mean()
+            day_df["bb"] = s.reindex(day_idx)
+        else:
+            day_df["bb"] = pd.NA
 
-        daily_rows.append({
-            "date": ds,
-            "hr": float(hr_day["hr"].mean()) if not hr_day.empty else None,
-            "stress": float(st_day["stress"].mean()) if not st_day.empty else None,
-            "bb": bb_val,
-            "resp": float(rp_day["resp"].mean()) if not rp_day.empty else None,
-            "steps": steps,
-            "kcal": kcal,
-            "sleep_flag": sleep_flag,
-        })
+        # Steps/Kcal (diarios)
+        steps = None
+        kcal = None
+        if p_us.exists():
+            us = load_json(p_us)
+            steps = find_first_number(us, ["totalSteps", "steps"])
+            kcal = find_first_number(us, ["totalKilocalories", "totalKiloCalories", "kilocalories", "kiloCalories"])
 
-    start = pd.Timestamp(days[0]).tz_localize(TZ)
-    end = (pd.Timestamp(days[-1]).tz_localize(TZ) + pd.Timedelta(days=1)) - pd.Timedelta(minutes=1)
-    idx = pd.date_range(start=start, end=end, freq=args.freq)
-    base = pd.DataFrame(index=idx)
+        day_df["steps"] = steps
+        day_df["kcal"] = kcal
 
-    def concat(frames, col):
-        if not frames:
-            return pd.DataFrame(columns=[col], index=pd.DatetimeIndex([], name="timestamp"))
-        df = pd.concat(frames).sort_index()
-        df = df[~df.index.duplicated(keep="last")]
-        return df[[col]]
+        # Sleep flag (ventana principal)
+        sleep_flag = pd.Series(0, index=day_idx, dtype="int8")
+        if p_sl.exists():
+            sl = load_json(p_sl)
+            win = parse_sleep_window(sl, args.tz)
+            if win is not None:
+                s0, s1 = win
+                mask = (day_idx >= s0) & (day_idx < s1)
+                sleep_flag.loc[mask] = 1
+        day_df["sleep_flag"] = sleep_flag
 
-    base = base.join(concat(hr_frames, "hr"), how="left")
-    base = base.join(concat(st_frames, "stress"), how="left")
-    base = base.join(concat(rp_frames, "resp"), how="left")
-    if not bb_series.empty:
-        base = base.join(bb_series, how="left")
+        # Si el día está vacío (sin ninguna métrica temporal), lo descartamos
+        core_cols = ["hr", "stress", "resp", "bb"]
+        has_any = day_df[core_cols].notna().any().any()
 
-    for c in ["hr","stress","resp","bb"]:
-        if c in base.columns:
-            base[c] = base[c].ffill()
+        if args.drop_empty_days and not has_any:
+            continue
 
-    daily = pd.DataFrame(daily_rows).sort_values("date")
-    daily2 = daily.copy()
-    daily2["day"] = pd.to_datetime(daily2["date"]).dt.tz_localize(TZ)
-    daily2 = daily2.set_index("day")[["steps","kcal"]]
-    base["day"] = base.index.floor("D")
-    base = base.join(daily2, on="day").drop(columns=["day"])
+        # Relleno BB dentro del día (opcional)
+        if args.bb_fill == "ffill":
+            day_df["bb"] = day_df["bb"].ffill()
+        elif args.bb_fill == "ffill_bfill":
+            day_df["bb"] = day_df["bb"].ffill().bfill()
+        elif args.bb_fill == "interpolate":
+            # interpolación temporal dentro del día
+            day_df["bb"] = (
+                day_df["bb"]
+                .astype("float64")
+                .interpolate(method="time", limit_direction="both")
+                .ffill()
+                .bfill()
+            )
 
-    base["sleep_flag"] = 0
-    for s_ms, e_ms in sleep_intervals:
-        s = pd.to_datetime(s_ms, unit="ms", utc=True).tz_convert(TZ)
-        e = pd.to_datetime(e_ms, unit="ms", utc=True).tz_convert(TZ)
-        s2 = max(s, base.index[0]); e2 = min(e, base.index[-1])
-        if e2 >= s2:
-            base.loc[(base.index >= s2) & (base.index <= e2), "sleep_flag"] = 1
+        # Daily row
+        hr_cov = float(day_df["hr"].notna().mean()) if "hr" in day_df else 0.0
+        st_cov = float(day_df["stress"].notna().mean()) if "stress" in day_df else 0.0
+        re_cov = float(day_df["resp"].notna().mean()) if "resp" in day_df else 0.0
+        bb_cov = float(day_df["bb"].notna().mean()) if "bb" in day_df else 0.0
 
-    minute_out = base.reset_index().rename(columns={"index":"timestamp"})
-    minute_out.to_parquet(out / "minute.parquet", index=False)
-    daily.to_parquet(out / "daily.parquet", index=False)
+        daily_rows.append(
+            {
+                "date": ds,
+                "hr": float(pd.to_numeric(day_df["hr"], errors="coerce").mean()) if day_df["hr"].notna().any() else None,
+                "stress": float(pd.to_numeric(day_df["stress"], errors="coerce").mean()) if day_df["stress"].notna().any() else None,
+                "resp": float(pd.to_numeric(day_df["resp"], errors="coerce").mean()) if day_df["resp"].notna().any() else None,
+                "bb": float(pd.to_numeric(day_df["bb"], errors="coerce").dropna().iloc[-1]) if day_df["bb"].notna().any() else None,
+                "steps": steps,
+                "kcal": kcal,
+                "sleep_flag": int(day_df["sleep_flag"].max()),
+                "coverage_hr": hr_cov,
+                "coverage_stress": st_cov,
+                "coverage_resp": re_cov,
+                "coverage_bb": bb_cov,
+            }
+        )
 
-    print("OK:")
-    print("-", out / "minute.parquet")
-    print("-", out / "daily.parquet")
+        minute_frames.append(day_df.reset_index(names="timestamp"))
+
+    if not minute_frames:
+        raise SystemExit("No se generó minute dataset (¿todo vacío?)")
+
+    minute = pd.concat(minute_frames, ignore_index=True)
+    daily = pd.DataFrame(daily_rows)
+    daily["date"] = pd.to_datetime(daily["date"]).dt.date
+
+    minute_path = out_dir / "minute.parquet"
+    daily_path = out_dir / "daily.parquet"
+    minute.to_parquet(minute_path, index=False)
+    daily.to_parquet(daily_path, index=False)
+
+    if args.write_csv:
+        minute.to_csv(out_dir / "minute.csv", index=False)
+        daily.to_csv(out_dir / "daily.csv", index=False)
+
+    print("✅ Dataset construido")
+    print("-", minute_path)
+    print("-", daily_path)
+    print("minute rows:", len(minute), "daily rows:", len(daily))
+
 
 if __name__ == "__main__":
     main()

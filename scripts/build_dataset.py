@@ -262,15 +262,17 @@ def main():
             continue
 
         # Relleno BB dentro del día (opcional)
+        day_df["bb"] = pd.to_numeric(day_df["bb"], errors="coerce")
         if args.bb_fill == "ffill":
             day_df["bb"] = day_df["bb"].ffill()
         elif args.bb_fill == "ffill_bfill":
             day_df["bb"] = day_df["bb"].ffill().bfill()
         elif args.bb_fill == "interpolate":
             # interpolación temporal dentro del día
+            # Convertir a numérico para evitar NAType (pd.NA) antes de interpolar
+            day_df["bb"] = pd.to_numeric(day_df["bb"], errors="coerce")
             day_df["bb"] = (
                 day_df["bb"]
-                .astype("float64")
                 .interpolate(method="time", limit_direction="both")
                 .ffill()
                 .bfill()
